@@ -273,6 +273,15 @@ start_vm() {
 
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -o ConnectTimeout=5)
 vm_ssh() { local port="$1"; shift; ssh "${SSH_OPTS[@]}" -i "$WORK/id_test" -p "$port" ubuntu@127.0.0.1 "$@"; }
+# Same, but forces a pseudo-terminal on the remote side (-tt, doubled so it
+# applies even though this script's own stdin is a pipe, not a tty). Needed
+# for bin/seal.sh, which refuses to run unless stdin is a terminal - the
+# password must come from a tty, never a pipe or a file. A pty makes the
+# remote `read -rsp` see a terminal while still letting us feed it the
+# throwaway test secret. Note the pty merges the remote's stderr into its
+# stdout, so callers capture one combined stream, and the line discipline
+# echoes what we write back into it.
+vm_ssh_tty() { local port="$1"; shift; ssh "${SSH_OPTS[@]}" -tt -i "$WORK/id_test" -p "$port" ubuntu@127.0.0.1 "$@"; }
 vm_scp() { local port="$1"; shift; scp "${SSH_OPTS[@]}" -i "$WORK/id_test" -P "$port" "$@"; }
 
 wait_for_ssh() {
@@ -397,10 +406,13 @@ if wait_for_ssh "$B1_SSHPORT"; then
   # effect - matches the real install.sh flow (usermod -aG tss, relogin).
   vm_ssh "$B1_SSHPORT" 'sudo usermod -aG tss ubuntu'
 
-  printf '%s\n%s\n' "$SECRET" "$SECRET" | vm_ssh "$B1_SSHPORT" \
-    'bash ~/tpm-keyring-unlock/bin/seal.sh' >"$WORK/seal.out" 2>"$WORK/seal.err"
+  # Through a pty, not a plain pipe: seal.sh exits early if stdin isn't a
+  # terminal (see vm_ssh_tty above). Output is one combined stream because
+  # of that pty, so there's a single file to hand `check` for diagnostics.
+  printf '%s\n%s\n' "$SECRET" "$SECRET" | vm_ssh_tty "$B1_SSHPORT" \
+    'bash ~/tpm-keyring-unlock/bin/seal.sh' >"$WORK/seal.out" 2>&1
   if [ $? -eq 0 ]; then got=sealed; else got=failed; fi
-  check "seal.sh seals the throwaway secret" "$got" "sealed" "$WORK/seal.err"
+  check "seal.sh seals the throwaway secret" "$got" "sealed" "$WORK/seal.out"
   log_pcr7 "$B1_SSHPORT" "boot 1, right after seal"
 
   UNSEAL1_START=$(date +%s%N)
@@ -413,16 +425,20 @@ if wait_for_ssh "$B1_SSHPORT"; then
   # A failed re-seal must not destroy the enrollment that already proved it
   # can unlock. Shadow only tpm2_create with a deterministic failure, accept
   # the overwrite prompt, and confirm the original secret still unseals.
+  # Through vm_ssh_tty for the same reason as the seal step above: a plain
+  # pipe is rejected by seal.sh's own [ -t 0 ] guard, which would make this
+  # check pass on the wrong failure - the script would exit before ever
+  # reaching the injected tpm2_create.
   vm_ssh "$B1_SSHPORT" \
     'mkdir -p ~/fail-bin && printf "#!/bin/sh\nexit 42\n" >~/fail-bin/tpm2_create && chmod 700 ~/fail-bin/tpm2_create'
-  if printf '%s\n%s\n%s\n' y replacement-secret replacement-secret | vm_ssh "$B1_SSHPORT" \
+  if printf '%s\n%s\n%s\n' y replacement-secret replacement-secret | vm_ssh_tty "$B1_SSHPORT" \
        'PATH="$HOME/fail-bin:$PATH" bash ~/tpm-keyring-unlock/bin/seal.sh' \
-       >"$WORK/reseal-failure.out" 2>"$WORK/reseal-failure.err"; then
+       >"$WORK/reseal-failure.out" 2>&1; then
     got=unexpected-success
   else
     got=failed-as-injected
   fi
-  check "injected tpm2_create failure makes re-seal fail" "$got" "failed-as-injected" "$WORK/reseal-failure.err"
+  check "injected tpm2_create failure makes re-seal fail" "$got" "failed-as-injected" "$WORK/reseal-failure.out"
 
   GOT_AFTER_FAILED_RESEAL="$(vm_ssh "$B1_SSHPORT" \
     'sudo bash ~/tpm-keyring-unlock/pam/tpm-keyring-unseal.sh ubuntu' \

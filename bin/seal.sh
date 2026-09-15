@@ -25,12 +25,23 @@ tpm2_pcrread "$PCR_BANK" >/dev/null 2>&1 || {
 }
 require_secure_boot
 
+if [ ! -t 0 ]; then
+  echo "This script is interactive - it reads your keyring password from the" >&2
+  echo "terminal, and must never take it from a pipe or a file. Run it" >&2
+  echo "directly from a terminal." >&2
+  exit 1
+fi
+
 mkdir -p "$DATA_DIR"
 chmod 700 "$DATA_DIR"
 
 if [ -f "$DATA_DIR/seal.priv" ]; then
-  read -rp "A sealed secret already exists at $DATA_DIR. Overwrite? [y/N] " ans
-  [[ "$ans" =~ ^[Yy]$ ]] || exit 0
+  # Y/n like every other prompt in this tool; a failed read (no terminal)
+  # declines rather than overwriting a working seal. Answering yes no longer
+  # deletes anything here - the replacement is built in STAGE_DIR and only
+  # moved into place once it has proved it unseals.
+  read -rp "A sealed secret already exists at $DATA_DIR. Overwrite? [Y/n] " ans || exit 0
+  [[ ! "$ans" =~ ^[Nn][Oo]?$ ]] || exit 0
 fi
 
 read -rsp "Password to seal (should match your GNOME login keyring password): " PASSWORD
@@ -138,6 +149,11 @@ if ! printf '%s' "$PASSWORD" | cmp -s - "$WORKDIR/unsealed"; then
   exit 1
 fi
 
+# Explicit modes rather than whatever the umask happens to be: install.sh may
+# run this inside `sg tss`, which makes tss the primary group, and none of
+# these should be readable by that group even if $DATA_DIR's own 700 were ever
+# loosened. Set here, before the mv below, so the files are never visible at
+# their final names with any other mode.
 chmod 600 "$STAGE_DIR/pcr.policy" "$STAGE_DIR/seal.pub" \
   "$STAGE_DIR/seal.priv" "$STAGE_DIR/primary.handle"
 

@@ -17,12 +17,20 @@ cd tpm-keyring-unlock
 Prints the full plan up front — every package to install, the `tss` group
 change, the exact PAM-file diff(s) it would apply (each backed up
 automatically) — and asks for approval exactly once before doing any of it.
-The one exception: if you need adding to the `tss` group (for passwordless
-TPM access), that step alone requires a relogin partway through, so the
-script stops there and asks you to re-run it once you're back. Your keyring
+If you need adding to the `tss` group (for passwordless TPM access), the run
+carries on inside `sg tss` and still finishes in one go; only on a distro
+whose `shadow` package ships no `sg` (Arch — see Requirements) does it stop
+there and ask you to log out, log back in and re-run. Your keyring
 password itself is typed interactively during sealing — never touches disk
 unencrypted, never passed as a command-line argument. See Requirements below
-before running it.
+before running it. Every prompt defaults to yes, so Enter accepts; the
+scripts refuse to run without a terminal rather than answering themselves.
+
+One `[Y/n]` question comes *before* that plan, and only on machines that have
+a fingerprint-only PAM stack: whether to also stop the fingerprint reader from
+dropping out mid-prompt (see "The fingerprint reader dropping out mid-prompt"
+below). It is asked first so your answer shows up in the plan you then
+approve — answering `n` leaves that file alone entirely.
 
 ## The problem
 
@@ -125,6 +133,133 @@ above, on a service that isn't named after fingerprints at all.
 `pam_gnome_keyring.so` line and patches all of them for exactly this
 reason.
 
+## The fingerprint reader dropping out mid-prompt
+
+This one is separate from the keyring problem, but `install.sh` offers to fix
+it while it's in there (the same `[Y/n]` prompt, asked before the plan, so
+declining costs you nothing else).
+
+Two everyday things make the fingerprint reader disappear for the rest of a
+lock screen, leaving only the password field while the sensor sits there
+working:
+
+- not touching the sensor within `pam_fprintd`'s idle timeout (30s by default);
+- **one badly angled or partial scan.**
+
+Both end up in the same place. The module returns `PAM_AUTHINFO_UNAVAIL`,
+which means *"there is no such authentication method here"* — the same answer
+it would give if the sensor were missing entirely. GDM relays that as
+`service-unavailable`, and gnome-shell treats it as permanent: it drops
+fingerprint for the rest of that unlock prompt. Dismissing the prompt and
+bringing it back resets it.
+
+`max-tries=` does **not** cover the bad-scan case. In `pam_fprintd` 1.94.5 the
+tries counter is decremented only in the `verify-no-match` branch — a clean
+mismatch. `verify-unknown-error` and `verify-disconnected`, which is what a
+bad scan turns into on some readers, jump straight to returning
+`PAM_AUTHINFO_UNAVAIL`.
+
+PAM has no loop construct, so the only fix at this level is to invoke the
+module again — each call re-claims and re-arms the device. `install.sh`
+rewrites the one `pam_fprintd.so` auth line into three attempts:
+
+```
+auth  [success=2 <fall through>]  pam_fprintd.so max-tries=1
+auth  [success=1 <fall through>]  pam_fprintd.so max-tries=1
+auth  required                    pam_fprintd.so max-tries=1
+```
+
+where `<fall through>` is `authinfo_unavail=ignore auth_err=ignore
+maxtries=ignore default=die`. One line is one scan, so **whatever goes wrong
+costs exactly one of the three attempts** — a mismatch, a bad scan, a timeout,
+all the same.
+
+- `max-tries=1` moves the module's own retry counter out of the way. Left at
+  its default of 3, a mismatch gets retried *inside* one module call while a
+  bad scan consumes a whole stack line — the two failure kinds count
+  differently, and a mixed run could cost up to nine finger placements.
+- `authinfo_unavail=ignore` covers a bad scan or a timeout, `auth_err=ignore`
+  an unrecognised verify result, `maxtries=ignore` the single no-match that
+  `max-tries=1` turns into `PAM_MAXTRIES`. All three fall through to the next
+  attempt instead of ending the conversation.
+- `default=die` still stops at once on anything genuinely broken — an aborted
+  conversation, a system error, no enrolled prints — which shouldn't be
+  retried three times over.
+- `success=N` is a *relative jump* over the remaining attempts, not `done`, so
+  a match still falls through to the keyring lines below. Verified in a
+  container against real libpam, not just read off the manual — see
+  `test/runtime-test.sh`.
+- **No `timeout=` is set**, and an earlier version's `timeout=-1` is stripped
+  on upgrade. `timeout=-1` (no idle limit) cannot coexist with an attempt
+  stack: an attempt ends only when the module returns, so with no deadline the
+  *first* attempt never returns, the stack never reaches the second, and the
+  whole prompt hangs instead of falling back to the password. Each attempt
+  keeps the module's own 30s default instead, which gives the sensor three
+  times as long as the single line it replaces — 90s in total — and still
+  ends. Measured against real libpam; see `JOURNAL.md`, 2026-09-15.
+- A `timeout=` the distro set itself is left alone, and survives an uninstall.
+- The service's own line stays in place as the last attempt, keeping its
+  control field, so the distro keeps the final verdict.
+
+Three attempts is also what the module's own default allowed before any of
+this (`max-tries=3`), so the number of tries per prompt is unchanged — only
+which failures count toward it.
+
+It is skipped entirely if the installed `pam_fprintd.so` doesn't understand
+`max-tries=` (fprintd older than 1.94) — the installer probes the module
+binary for the option rather than guessing from a version string.
+
+This is applied **only** to a PAM service whose auth phase offers fingerprint
+and nothing else — `gdm-fingerprint` on Ubuntu/Debian — and the file is backed
+up first. Three further shapes are refused rather than guessed at, because the
+rewrite can't reproduce them faithfully:
+
+- a stack whose fingerprint line is `sufficient` (or `[…success=done…]`).
+  `sufficient` *ends* the stack on a match; the attempt lines jump and carry
+  on, so on a stack like `auth sufficient pam_fprintd.so` / `auth required
+  pam_deny.so` a matched finger would land on the deny.
+- a stack with a numeric jump (`[success=1 …]`) on a line above the
+  fingerprint one — `pam_succeed_if.so user ingroup nopasswdlogin`, typically.
+  A jump counts modules from where it sits, so inserting lines above its
+  target silently re-aims it.
+- anything with a second auth-phase module that isn't pure gating, including
+  one written with PAM's leading-dash syntax (`-auth … pam_systemd_home.so`).
+
+It deliberately refuses to touch a *shared* stack such as `common-auth`, even
+though that's where Ubuntu puts its own `timeout=10`. PAM is strictly
+serialised: `common-auth` runs `pam_fprintd` and then `pam_unix`, so three
+waits on the sensor there would delay `sudo`'s password prompt by three times
+the idle timeout on every invocation. If you want a longer window for
+`sudo`, edit `/usr/share/pam-configs/fprintd` and re-run
+`sudo pam-auth-update` — editing `/etc/pam.d/common-auth` directly gets
+reverted, since `pam-auth-update` regenerates that file.
+
+Two things worth knowing:
+
+- Three attempts, then it's the password — counting mismatches and bad scans
+  alike. GNOME also has its own `allowed-failures` setting (`gsettings get
+  org.gnome.login-screen allowed-failures`), which governs the login screen
+  separately.
+- `/etc/pam.d/gdm-fingerprint` belongs to the `gdm` package, so a gdm upgrade
+  can restore its version of the file. Re-run `install.sh` if the reader
+  starts dropping out again.
+
+`uninstall.sh` reverses the edit, and is deliberately narrow about it:
+
+- it only touches a file it can prove it wrote itself — strip the stack back
+  down, build it up again, require the result to match the file byte for byte
+  — and it backs the file up first, same as the install side;
+- it puts back the distro's **exact original line**, from the
+  `.bak-<timestamp>` copy `install.sh` took, whenever that copy is provably
+  the file that was hardened into what's on disk now. That is the only way an
+  explicit `max-tries=` the distro had set comes back — a distro's `timeout=`
+  is never overwritten in the first place, so that one survives regardless;
+  without such a copy the line returns on the module's defaults instead, and
+  the uninstaller says so;
+- if a file carries the attempt lines but has been edited since, it says so
+  and leaves it alone, rather than silently skipping it and letting you think
+  everything was reverted.
+
 ## Requirements
 
 Hard requirements — the tool refuses to proceed without these, they're not
@@ -162,6 +297,13 @@ run there:
 - `apt`, `dnf`, `pacman`, and `zypper` systems for the dependency-install
   step.
 - `x86_64` and `aarch64` machines for PAM module install-path detection.
+- **Arch, with one rough edge:** its `shadow` package ships `newgrp` but not
+  `sg`, and `newgrp` has no way to run a single command. `install.sh` uses `sg`
+  to keep going in the same session right after adding you to the `tss` group;
+  without it, the run stops there and asks you to log out, log back in and
+  re-run, which is the behaviour every distro had before. Everything else is
+  unaffected. (Verified in the packaging test, which reports this as a note
+  rather than a failure.)
 
 **Won't work, by design or by architecture mismatch:**
 - **KDE Plasma with KWallet.** Different secrets service entirely, not
@@ -214,6 +356,19 @@ What this does **not** protect against: anyone with control of your running,
 logged-in machine (root, or you) can read the sealed secret's decrypted
 value the same way this tool does — that's inherent to "unlock
 automatically without asking," not a bug specific to this approach.
+
+One detail worth stating plainly, since the fingerprint stack invites the
+question: a **failed** fingerprint attempt still triggers an unseal. The last
+attempt line is the distro's own `required` one, and libpam keeps walking the
+stack after a `required` module fails, so `pam_tpm_keyring_authtok.so` below it
+runs and asks the TPM for the secret even though nobody authenticated. The
+login still fails, the token is discarded, and the unseal happens inside gdm's
+root worker — but it does mean someone at your locked screen can make the TPM
+perform an unseal by touching the sensor. That isn't introduced here: it's what
+the stack already did before this tool touched it, and the seal's policy is
+bound to PCR7 (the machine's state), not to who is standing in front of it.
+Making that last line `requisite` would avoid it, at the cost of rewriting the
+distro's own control field — deliberately not done.
 
 If your BIOS Secure Boot settings ever change (enabled/disabled, keys
 reset), PCR7 changes and the seal breaks — you'll need to re-run

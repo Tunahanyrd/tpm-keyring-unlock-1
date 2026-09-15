@@ -11,9 +11,34 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/bin/lib.sh"
 confirm() {
   local prompt="$1"
   local ans
-  read -rp "$prompt [y/N] " ans
-  [[ "$ans" =~ ^[Yy]$ ]]
+  # Defaults to yes: an empty answer accepts. A failed read (EOF, i.e. no
+  # terminal) is a "no", so nothing here can be auto-approved by a pipe.
+  read -rp "$prompt [Y/n] " ans || return 1
+  [[ ! "$ans" =~ ^[Nn][Oo]?$ ]]
 }
+
+# One timestamp for the whole run, so a file touched by two different steps
+# below gets exactly one backup, holding its pristine pre-run content - same
+# rule install.sh follows.
+RUN_TS="$(date +%Y%m%d%H%M%S)"
+
+# Backs a PAM file up before its first modification in this run. Undoing an
+# edit to a login-critical file is still an edit to a login-critical file, so
+# it gets the same .bak-<timestamp> copy the install side takes.
+backup_pam_file() {
+  local f="$1" bak="$1.bak-$RUN_TS"
+  [ -e "$bak" ] || sudo cp "$f" "$bak"
+}
+
+# Every prompt below defaults to yes, so a run with no terminal must not be
+# allowed to answer them by hitting EOF. read() failing counts as "no" in
+# confirm() for that reason, but bail out up front anyway rather than
+# half-running and then dying on "sudo: a terminal is required to
+# authenticate" partway through.
+if [ ! -t 0 ]; then
+  echo "This script is interactive - run it directly from a terminal." >&2
+  exit 1
+fi
 
 echo "== tpm-keyring-unlock uninstaller =="
 echo
@@ -24,12 +49,120 @@ echo
 # line (gdm-password included, once system-wide fingerprint auth is on).
 for f in /etc/pam.d/*; do
   [ -f "$f" ] || continue
+  if [[ "$f" =~ $PAM_NON_SERVICE_RE ]]; then continue; fi
   if grep -q pam_tpm_keyring_authtok.so "$f"; then
     echo "Found the injected line in $f"
     if confirm "Remove it?"; then
+      backup_pam_file "$f"
       sudo sed -i '/pam_tpm_keyring_authtok\.so/d' "$f"
-      echo "Removed."
+      echo "Removed (previous content backed up as $f.bak-$RUN_TS)."
     fi
+  fi
+done
+
+# --- 1b. undo the fingerprint attempt-stack edit -------------------------
+# Two ways back, best first:
+#
+#   exact     restore the .bak-<timestamp> copy install.sh took before it
+#             edited the file - but only one that is provably the direct
+#             ancestor of what's on disk now (see pam_fprintd_exact_original
+#             below). This is the only path that brings back an explicit
+#             timeout=/max-tries= the distro had set, since unharden has no
+#             way to know what was there before.
+#   defaults  failing that, strip the attempt lines and the options install.sh
+#             set, leaving one pam_fprintd.so line on the module's own
+#             defaults (30s idle, and one bad scan ends fingerprint for that
+#             prompt - see JOURNAL.md, 2026-09-14).
+#
+# pam_fprintd_stack_is_generated() is the gate, not "unharden would change
+# something": unharden strips max-tries=1, which Debian's pam-auth-update
+# writes into common-auth itself, so the looser test offered to "restore" a
+# shared stack install.sh refuses to touch by design. A file that carries our
+# attempt lines but fails that gate has been edited since, so it gets a
+# warning rather than a silent skip - it is the one case where the user walks
+# away thinking everything is reverted when it isn't. See JOURNAL.md,
+# 2026-09-15.
+
+for f in /etc/pam.d/*; do
+  [ -f "$f" ] || continue
+  if [[ "$f" =~ $PAM_NON_SERVICE_RE ]]; then continue; fi
+
+  HAS_ATTEMPTS=false
+  if grep -qE "$PAM_FPRINTD_RETRY_LINE_RE" "$f"; then HAS_ATTEMPTS=true; fi
+  # timeout=-1 is a *legacy* signature: versions of this tool before
+  # 2026-09-15 put it on every attempt, and no distro ships it, so unlike
+  # max-tries=1 (which Debian's own pam-auth-update writes into common-auth)
+  # it cannot be confused with somebody else's config. Checked separately so
+  # an older install whose attempt lines are gone but whose options are still
+  # ours - a partial hand edit - is still offered, instead of being skipped in
+  # silence with this tool's settings left on a login path.
+  #
+  # Current installs leave no such single-line signature, because max-tries=1
+  # is all they set and that is genuinely ambiguous. Stated rather than
+  # papered over: a current stack whose attempt lines someone deleted by hand
+  # is not detected here. That leftover is also far milder than timeout=-1 was
+  # - one scan per prompt, which is what the distro's own line does on a bad
+  # scan anyway - and the attempt lines remain the reliable marker for every
+  # file this tool actually wrote.
+  HAS_OUR_OPTS=false
+  if grep -qE "${PAM_FPRINTD_AUTH_RE}.*timeout=-1" "$f"; then HAS_OUR_OPTS=true; fi
+  if [ "$HAS_ATTEMPTS" = false ] && [ "$HAS_OUR_OPTS" = false ]; then continue; fi
+
+  if [ "$HAS_ATTEMPTS" = true ] && ! pam_fprintd_stack_is_generated "$f"; then
+    echo "$f carries fingerprint attempt lines with this tool's marker" >&2
+    echo "(authinfo_unavail=ignore), but the file is not what install.sh" >&2
+    echo "would have written - either something edited it since, or it was" >&2
+    echo "somebody's own retry stack all along. Left untouched rather than" >&2
+    echo "guessed at." >&2
+    if compgen -G "$f.bak-*" >/dev/null; then
+      echo "There is a pre-install copy beside it, if it was ours:" >&2
+      # shellcheck disable=SC2012
+      ls -1 "$f".bak-* >&2
+    fi
+    echo >&2
+    continue
+  fi
+
+  if [ "$HAS_ATTEMPTS" = true ]; then
+    echo "Found install.sh's fingerprint attempt stack in $f"
+  else
+    echo "Found an older install.sh's timeout=-1 on the pam_fprintd.so line in $f"
+    echo "(its attempt lines are already gone - only the options are left)"
+  fi
+  ORIGINAL="$(pam_fprintd_exact_original "$f" || true)"
+  if [ -n "$ORIGINAL" ]; then
+    PROMPT="Restore the original line exactly, from $(basename "$ORIGINAL")?"
+  else
+    PROMPT="Put it back to a single pam_fprintd.so line with module defaults?"
+  fi
+  if confirm "$PROMPT"; then
+    if [ -n "$ORIGINAL" ]; then
+      backup_pam_file "$f"
+      # cp *onto* the existing file rather than replacing it, so its mode and
+      # ownership stay exactly as the distro shipped them.
+      sudo cp "$ORIGINAL" "$f"
+      echo "Restored exactly, from $ORIGINAL"
+      echo "(previous content backed up as $f.bak-$RUN_TS)."
+      continue
+    fi
+    REWRITTEN="$(mktemp)"
+    pam_fprintd_unharden <"$f" >"$REWRITTEN"
+    # same invariant install.sh writes under: every non-fprintd line identical,
+    # exactly one fprintd auth line left, no generated lines, no timeout=-1
+    if diff -q <(grep -vE "$PAM_FPRINTD_AUTH_RE" "$f") \
+        <(grep -vE "$PAM_FPRINTD_AUTH_RE" "$REWRITTEN") >/dev/null \
+      && [ "$(grep -cE "$PAM_FPRINTD_AUTH_RE" "$REWRITTEN")" = 1 ] \
+      && ! grep -qE "$PAM_FPRINTD_RETRY_LINE_RE" "$REWRITTEN" \
+      && ! grep -qE "${PAM_FPRINTD_AUTH_RE}.*timeout=-1" "$REWRITTEN"; then
+      backup_pam_file "$f"
+      sudo cp "$REWRITTEN" "$f"
+      echo "Restored to the module's defaults (no pre-install copy of this file"
+      echo "was found, so an explicit timeout= it may have had is not back)."
+      echo "Previous content backed up as $f.bak-$RUN_TS."
+    else
+      echo "Unexpected result rewriting $f - left it untouched." >&2
+    fi
+    rm -f "$REWRITTEN"
   fi
 done
 
