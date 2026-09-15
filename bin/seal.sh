@@ -137,8 +137,16 @@ tpm2_load -C "$PRIMARY_HANDLE" \
 TEST_SESSION="$WORKDIR/test-session"
 tpm2_startauthsession -S "$TEST_SESSION" --policy-session >/dev/null
 tpm2_policypcr -S "$TEST_SESSION" -l "$PCR_BANK" >/dev/null
-tpm2_unseal -c "$TEST_OBJECT" -p "session:$TEST_SESSION" \
-  >"$WORKDIR/unsealed"
+# Into a shell variable, never a file. $WORKDIR is a mktemp -d under /tmp,
+# which is tmpfs on most distros but tmpfs pages are swappable, and swap is
+# not necessarily on an encrypted volume - so writing the unsealed keyring
+# password there can land the one secret this whole tool exists to protect
+# on disk in the clear. A command substitution keeps it in this process's
+# memory, like $PASSWORD itself, and it is not a pipeline, so `set -e` still
+# aborts the seal if tpm2_unseal genuinely fails instead of silently
+# comparing against nothing. No trailing-newline hazard: $PASSWORD comes
+# from `read`, so it cannot contain one for the stripping to matter.
+UNSEALED="$(tpm2_unseal -c "$TEST_OBJECT" -p "session:$TEST_SESSION")"
 
 # Best-effort, exactly like pam/tpm-keyring-unseal.sh does after its own
 # unseal - NOT decoration. Once tpm2_unseal has consumed the session, the
@@ -154,8 +162,9 @@ TEST_SESSION=""
 tpm2_flushcontext "$TEST_OBJECT" >/dev/null 2>&1 || true
 TEST_OBJECT=""
 
-if ! printf '%s' "$PASSWORD" | cmp -s - "$WORKDIR/unsealed"; then
+if [ "$UNSEALED" != "$PASSWORD" ]; then
   echo "TPM self-test returned a different secret; keeping the previous enrollment." >&2
+  unset PASSWORD PASSWORD2 UNSEALED
   exit 1
 fi
 
@@ -167,7 +176,7 @@ fi
 chmod 600 "$STAGE_DIR/pcr.policy" "$STAGE_DIR/seal.pub" \
   "$STAGE_DIR/seal.priv" "$STAGE_DIR/primary.handle"
 
-unset PASSWORD PASSWORD2
+unset PASSWORD PASSWORD2 UNSEALED
 
 # Each file is now complete, verified, and on the destination filesystem.
 # No earlier failure path modifies the previous enrollment.

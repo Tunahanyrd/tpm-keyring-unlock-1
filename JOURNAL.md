@@ -3679,3 +3679,66 @@ reaches the code under test. Both times it was masked - once by the tty
 guard, once by this - the surrounding checks are what exposed it. Such an
 assertion should pin the *reason*: match the injected exit status, or grep
 the captured output for the tool that was supposed to fail.
+
+## The re-seal self-test wrote the keyring password to disk in the clear (2026-09-15, after CI went green)
+
+With CI green on the merged PR #5 branch, the remaining review items were
+triaged by whether they threaten stored data. One did, and it is the only
+change made here - the rest work and were deliberately left alone.
+
+**Problem.** PR #5's self-test proved the staged object unseals by writing
+the result to a file and comparing:
+
+    tpm2_unseal -c "$TEST_OBJECT" -p "session:$TEST_SESSION" >"$WORKDIR/unsealed"
+    ...
+    if ! printf '%s' "$PASSWORD" | cmp -s - "$WORKDIR/unsealed"; then
+
+`$WORKDIR` is a plain `mktemp -d`, so that file lands under `/tmp`. The
+reflex answer is "`/tmp` is tmpfs, it never touches a disk" - which is a
+distro default, not a guarantee, and is not the whole story even when it
+holds. Checked on this machine rather than assumed:
+
+    $ findmnt -no FSTYPE,OPTIONS /tmp
+    tmpfs rw,nosuid,nodev,size=15799436k,...
+    $ swapon --show
+    NAME      TYPE SIZE USED PRIO
+    /swap.img file   8G   0B   -1
+    $ findmnt -no SOURCE,FSTYPE /
+    /dev/nvme0n1p5 ext4          # no LUKS, no crypt devices at all
+
+tmpfs pages are swappable, the swap file lives on the root filesystem, and
+that filesystem is not encrypted. So the GNOME keyring password - the one
+secret this entire project exists to keep inside the TPM - could be written
+to persistent storage in the clear, by the very step that was added to make
+sealing safer. `rm -rf "$WORKDIR"` in the trap does not help: it unlinks a
+file, it does not recall a page the kernel already swapped out.
+
+**Fix.** Keep it in process memory, where `$PASSWORD` already lives:
+
+    UNSEALED="$(tpm2_unseal -c "$TEST_OBJECT" -p "session:$TEST_SESSION")"
+    ...
+    if [ "$UNSEALED" != "$PASSWORD" ]; then
+
+Command substitution rather than `cmp -s - <(tpm2_unseal ...)` on purpose.
+Process substitution would equally avoid the file, but it makes the unseal
+part of a comparison instead of a command: a genuine `tpm2_unseal` failure
+would then surface as "returned a different secret" rather than aborting on
+its own error. A plain assignment keeps `set -e` behaviour intact, since the
+assignment's exit status is the substitution's. Command substitution strips
+trailing newlines, which cannot matter here - `$PASSWORD` comes from `read`,
+so it has none to lose. `UNSEALED` joins the `unset` on both the mismatch
+path and the success path.
+
+**Audited the rest of the repo for the same shape.** The only other
+`tpm2_unseal` is `pam/tpm-keyring-unseal.sh:71`, which writes to stdout for
+the PAM module to read over a pipe - no file, by design. No other place
+writes a secret anywhere.
+
+**Confirmed** with `test/vm/run-vm-test.sh` on the fixed tree: all checks
+pass, including the real-TPM round trip, the injected-failure regression and
+reboot survival.
+
+**Deliberately not changed** (they work; see the previous entry for the full
+list): the missing retry around the self-test's policy session, the staged
+`primary.handle`, and the injected-failure check that passes for any
+failure.
