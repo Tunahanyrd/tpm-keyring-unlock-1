@@ -3579,3 +3579,103 @@ rather than a conflict resolution:
    `uninstall.sh` (which reads `primary.handle` to evict) will not clean it
    up. It is derived, idempotent metadata, not part of the enrollment being
    protected, so it belongs in `DATA_DIR` immediately after `evictcontrol`.
+
+## The staged self-test aborted every seal: `tpm2_flushcontext` after `tpm2_unseal` fails on `/dev/tpmrm0` (2026-09-15, after merging PR #5)
+
+CI on the merged PR #5 branch failed one job - "VM (swtpm + OVMF) - real
+TPM/Secure Boot round trip" - with five checks red:
+
+    FAIL - seal.sh seals the throwaway secret (got: failed, want: sealed)
+    FAIL - tpm-keyring-unseal.sh returns the sealed secret (same boot) (got: , want: vm-test-throwaway-secret-...)
+    ok   - injected tpm2_create failure makes re-seal fail
+    FAIL - failed re-seal preserves the previous working secret (got: , want: ...)
+    FAIL - two concurrent unseal calls both succeed (flock serialization) (got: 1= 2=, want: both-correct)
+    FAIL - tpm-keyring-unseal.sh survives a real reboot (got: , want: ...)
+
+Only the first is a real failure; the rest report an empty `got:` because
+nothing was ever sealed. Note the one `ok` in the middle - "injected
+`tpm2_create` failure makes re-seal fail" passed while testing nothing at
+all, for the second time in this file. It only asserts that the re-seal
+*failed*, and it does, for whatever reason happens to be current.
+
+The captured pty stream named the failing tool but not the line:
+
+    | Persisting primary key into the TPM at 0x81018000 (one-time cost;
+    | avoids recomputing it on every future login - see JOURNAL.md).
+    | ERROR: Could not read serialized ESYS_TR from disk
+    | ERROR: Could not load session context
+    | ERROR: Argument neither a session nor a transient.
+    | ERROR: Unable to run tpm2_flushcontext
+
+Every command between that echo and the error is `>/dev/null` on success,
+so the log cannot say *which* `tpm2_flushcontext` died.
+
+**Two wrong guesses, and why the first repro was worthless.** The first
+hypothesis was that `tpm2_unseal -p session:FILE` consumes and deletes the
+session file. Tested against a standalone `swtpm` over TCP: the file
+survived, and `tpm2_flushcontext` on it returned 0. Hypothesis dead.
+
+The second attempt - replaying `bin/seal.sh`'s exact TPM sequence against
+that same standalone swtpm - died at `tpm2_create` with `out of memory for
+object contexts`, which is not the CI failure at all. That is the tell:
+talking to swtpm directly means there is **no resource manager**, so every
+transient object stays loaded and the slots run out. `/dev/tpmrm0`, which
+is what both the VM guest and this machine actually use, is the in-kernel
+resource manager - it swaps objects in and out, and it **flushes everything
+a client created when that client closes the device**. No host-side repro
+without one is faithful. `tpm2-abrmd` is not installed here, so the only
+faithful environment is the VM test itself.
+
+**Reproduced locally with `test/vm/run-vm-test.sh`** - byte-identical
+failure, same five checks, same four ERROR lines. That is the whole reason
+this test layer exists.
+
+**Root cause.** Each `tpm2_*` invocation is its own process, so each opens
+and closes `/dev/tpmrm0`. When `tpm2_unseal` exits, the resource manager
+drops the session and the loaded object it was using; the saved context
+files left on disk no longer resolve to anything. The PR's self-test then
+runs, bare and under `set -euo pipefail`:
+
+    tpm2_flushcontext "$TEST_SESSION" >/dev/null
+    tpm2_flushcontext "$TEST_OBJECT" >/dev/null
+
+which exits non-zero and takes the whole seal down - *after* the self-test
+had already succeeded. The evidence that pins it to these two lines and not
+to the earlier `tpm2_flushcontext "$SESSION"` on line 122: that earlier one
+is byte-identical to `main`'s, where this same VM job is green. It flushes
+a session that `tpm2_policypcr` wrote and nothing has consumed.
+
+This was already known in this repo and simply not carried across.
+`pam/tpm-keyring-unseal.sh` has always written the post-unseal flush as
+`tpm2_flushcontext "$SESSION_CTX" >/dev/null 2>&1 || true` - both on the
+success path and the retry path. The `|| true` there is not defensive
+style; it is this exact failure, tolerated.
+
+**Fix:** same treatment in `bin/seal.sh`, with a comment saying why so the
+next person does not "tidy up" the `|| true`. Nothing leaks by tolerating
+it - the resource manager is what cleaned the handles up in the first
+place, and the EXIT trap retries the same flushes just as tolerantly.
+
+**Confirmed** by re-running `test/vm/run-vm-test.sh` on the fixed tree:
+
+    ok   - seal.sh seals the throwaway secret
+    ok   - tpm-keyring-unseal.sh returns the sealed secret (same boot)
+    ok   - injected tpm2_create failure makes re-seal fail
+    ok   - failed re-seal preserves the previous working secret
+    ok   - two concurrent unseal calls both succeed (flock serialization)
+    ok   - tpm-keyring-unseal.sh survives a real reboot (fresh primary, same sealed blob)
+    All VM tests passed.
+
+Worth noting what that fourth line means: this is the first run in which
+PR #5's regression test has ever actually tested its own premise - a real
+`tpm2_create` failure mid-re-seal, with the previously sealed secret still
+unsealing afterwards. The reboot-survival check also passes as a hard check
+here, unlike on the CI runner where PCR7 differs between boots and it is
+downgraded to a KNOWN LIMITATION.
+
+**Standing lesson, now twice over.** A check written as "the command
+failed, as injected" passes for any failure, including one that never
+reaches the code under test. Both times it was masked - once by the tty
+guard, once by this - the surrounding checks are what exposed it. Such an
+assertion should pin the *reason*: match the injected exit status, or grep
+the captured output for the tool that was supposed to fail.

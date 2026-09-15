@@ -139,9 +139,19 @@ tpm2_startauthsession -S "$TEST_SESSION" --policy-session >/dev/null
 tpm2_policypcr -S "$TEST_SESSION" -l "$PCR_BANK" >/dev/null
 tpm2_unseal -c "$TEST_OBJECT" -p "session:$TEST_SESSION" \
   >"$WORKDIR/unsealed"
-tpm2_flushcontext "$TEST_SESSION" >/dev/null
+
+# Best-effort, exactly like pam/tpm-keyring-unseal.sh does after its own
+# unseal - NOT decoration. Once tpm2_unseal has consumed the session, the
+# kernel resource manager behind /dev/tpmrm0 has already dropped both
+# handles, so these saved context files no longer resolve and
+# tpm2_flushcontext exits non-zero ("Could not load session context" /
+# "Argument neither a session nor a transient"). Under `set -e` that aborted
+# the whole seal *after* a successful self-test. Nothing leaks by tolerating
+# it: the resource manager is what cleaned them up in the first place, and
+# the EXIT trap re-tries the same flushes just as tolerantly.
+tpm2_flushcontext "$TEST_SESSION" >/dev/null 2>&1 || true
 TEST_SESSION=""
-tpm2_flushcontext "$TEST_OBJECT" >/dev/null
+tpm2_flushcontext "$TEST_OBJECT" >/dev/null 2>&1 || true
 TEST_OBJECT=""
 
 if ! printf '%s' "$PASSWORD" | cmp -s - "$WORKDIR/unsealed"; then
